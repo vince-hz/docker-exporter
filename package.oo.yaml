@@ -1,0 +1,26 @@
+version: 0.0.1
+scripts:
+  # Script executed when the container is first loaded
+  # eg: bootstrap: poetry add pandas
+  bootstrap: |
+    npm install
+    poetry install --no-root
+    # Install Docker if not available
+    if ! command -v docker &> /dev/null; then
+      echo "Docker not found. Installing Docker..."
+      # For Debian/Ubuntu systems
+      apt-get update
+      apt-get install -y ca-certificates curl gnupg lsb-release
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      apt-get update
+      apt-get install -y docker-ce docker-ce-cli containerd.io
+    fi
+    # Start Docker daemon if not running
+    service docker start || echo "Docker daemon start attempted"
+name: docker-exporter
+repository: https://github.com/vince-hz/docker-exporter.git
+releaseNotes: init
+icon: ":twemoji:passenger-ship:"
+displayName: docker-exporter
+description: 这是一个用于下载 Docker 镜像并导出为 tar 文件的 OOMOL 工作流工具，支持指定架构，可用于离线部署。
