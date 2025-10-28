@@ -7,9 +7,7 @@ authors = [
 ]
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
-dependencies = [
-    "docker (>=7.1.0,<8.0.0)"
-]
+dependencies = []
 
 [tool.poetry]
 package-mode = false

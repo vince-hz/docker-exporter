@@ -1,4 +1,4 @@
-version: 1.0.0
+version: 1.0.1
 scripts:
   # Script executed when the container is first loaded
   # eg: bootstrap: poetry add pandas
@@ -16,4 +16,4 @@ repository: https://github.com/vince-hz/docker-exporter.git
 icon: ":twemoji:passenger-ship:"
 displayName: docker-exporter
 description: 这是一个用于下载 Docker 镜像并导出为 tar 文件的 OOMOL 工作流工具，支持指定架构，可用于离线部署。
-releaseNotes: use skopeo
+releaseNotes: remove useless dependency
