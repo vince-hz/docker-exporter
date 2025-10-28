@@ -1,6 +1,5 @@
 #region generated meta
 import typing
-from oocana import Context
 class Inputs(typing.TypedDict):
     image_name: str
     platform: str
@@ -12,17 +11,19 @@ class Outputs(typing.TypedDict):
     export_format: typing.NotRequired[str]
 #endregion
 
-import docker
+import subprocess
 import os
 import logging
 import tarfile
 import tempfile
+import json
 import shutil
 from pathlib import Path
+from oocana import Context
 
 def main(params: Inputs, context: Context) -> Outputs:
     """
-    Download Docker image with specific architecture and export as tar file or folder
+    Download Docker image with specific architecture and export as tar file or folder using skopeo
 
     Args:
         params: Input parameters containing image name, architecture, and output path
@@ -36,20 +37,17 @@ def main(params: Inputs, context: Context) -> Outputs:
         logging.basicConfig(level=logging.INFO)
         logger = logging.getLogger(__name__)
 
-        # Initialize Docker client with better error handling
+        # Check if skopeo is installed
         try:
-            client = docker.from_env()
-        except docker.errors.DockerException as e:
-            if "Connection aborted" in str(e) or "No such file or directory" in str(e):
-                raise Exception(
-                    "Docker daemon is not running. Please start Docker service:\n"
-                    "• On Linux/macOS: sudo systemctl start docker\n"
-                    "• On Windows: Start Docker Desktop\n"
-                    "• On macOS: Start Docker Desktop\n"
-                    "If Docker is not installed, please install it first."
-                )
-            else:
-                raise Exception(f"Failed to connect to Docker: {str(e)}")
+            subprocess.run(["skopeo", "--version"], check=True, capture_output=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            raise Exception(
+                "skopeo is not installed. Please install it first:\n"
+                "• On Ubuntu/Debian: sudo apt-get install skopeo\n"
+                "• On CentOS/RHEL: sudo yum install skopeo\n"
+                "• On macOS: brew install skopeo\n"
+                "• Or download from: https://github.com/containers/skopeo"
+            )
 
         image_name = params["image_name"]
         platform = params["platform"]
@@ -89,91 +87,135 @@ def main(params: Inputs, context: Context) -> Outputs:
         logger.info(f"Final output path: {final_output_path}")
         logger.info(f"Export format: {export_format}")
 
-        # Pull image with specific platform
-        try:
-            image = client.images.pull(image_name, platform=platform)
-        except docker.errors.ImageNotFound:
-            # Try without platform specification if specific platform fails
-            logger.warning(f"Platform {platform} not found, trying default platform")
-            image = client.images.pull(image_name)
+        # Create temporary directory for skopeo operations
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_image_path = os.path.join(temp_dir, "temp_image")
 
-        # Get image details
-        image_id = image.id
-        image_size = image.attrs.get('Size', 0)
+            # Build skopeo command with platform override if specified
+            skopeo_cmd = ["skopeo", "copy"]
 
-        logger.info(f"Image downloaded successfully. ID: {image_id}, Size: {image_size} bytes")
+            # Add platform override if specified
+            if platform and platform.lower() != "all":
+                skopeo_cmd.extend(["--override-os", platform.split("/")[0]])
+                if "/" in platform:
+                    skopeo_cmd.extend(["--override-arch", platform.split("/")[1]])
 
-        # Ensure output directory exists
-        if export_format == "folder":
-            output_dir = final_output_path
-        else:
-            output_dir = os.path.dirname(final_output_path)
+            # Add source and destination
+            source_image = f"docker://{image_name}"
+            dest_image = f"oci:{temp_image_path}"
 
-        if output_dir:
-            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            skopeo_cmd.extend([source_image, dest_image])
 
-        # Export image based on format
-        logger.info(f"Exporting image as {export_format} to: {final_output_path}")
+            logger.info(f"Running skopeo command: {' '.join(skopeo_cmd)}")
 
-        # Get the image object for export
-        image_obj = client.images.get(image_id)
+            # Run skopeo to download the image
+            try:
+                subprocess.run(skopeo_cmd, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                # Try without platform specification if specific platform fails
+                if platform and platform.lower() != "all":
+                    logger.warning(f"Platform {platform} not found, trying default platform")
+                    fallback_cmd = ["skopeo", "copy", source_image, dest_image]
+                    subprocess.run(fallback_cmd, check=True, capture_output=True, text=True)
+                else:
+                    raise Exception(f"Failed to download image with skopeo: {e.stderr}")
 
-        if export_format == "folder":
-            # Export to temporary tar file first, then extract
-            with tempfile.NamedTemporaryFile(suffix='.tar', delete=False) as temp_tar:
-                temp_tar_path = temp_tar.name
+            # Get image details from the OCI layout
+            try:
+                # Read the manifest to get image details
+                manifest_path = os.path.join(temp_image_path, "blobs", "sha256")
+                index_path = os.path.join(temp_image_path, "index.json")
 
-                # Export image to temporary tar file
-                for chunk in image_obj.save():
-                    temp_tar.write(chunk)
+                if os.path.exists(index_path):
+                    with open(index_path, 'r') as f:
+                        index_data = json.load(f)
 
-            # Extract tar file to output folder
-            logger.info(f"Extracting tar file to folder: {final_output_path}")
-            with tarfile.open(temp_tar_path, 'r') as tar:
-                tar.extractall(final_output_path)
+                    # Get the first manifest digest
+                    if index_data.get("manifests"):
+                        manifest_digest = index_data["manifests"][0]["digest"]
+                        manifest_file = os.path.join(manifest_path, manifest_digest.split(":")[1])
 
-            # Clean up temporary tar file
-            os.unlink(temp_tar_path)
+                        if os.path.exists(manifest_file):
+                            with open(manifest_file, 'r') as f:
+                                manifest_data = json.load(f)
 
-            logger.info(f"Image successfully extracted to folder: {final_output_path}")
+                            # Extract image ID from config digest
+                            if manifest_data.get("config"):
+                                image_id = manifest_data["config"]["digest"]
+                            else:
+                                image_id = manifest_digest
+                        else:
+                            image_id = manifest_digest
+                    else:
+                        image_id = "unknown"
+                else:
+                    image_id = "unknown"
 
-            # Calculate total size of extracted folder
-            total_size = 0
-            for dirpath, _, filenames in os.walk(final_output_path):
-                for filename in filenames:
-                    filepath = os.path.join(dirpath, filename)
-                    if os.path.exists(filepath):
-                        total_size += os.path.getsize(filepath)
+                # Calculate total size of downloaded image
+                total_size = 0
+                for root, dirs, files in os.walk(temp_image_path):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        if os.path.exists(file_path):
+                            total_size += os.path.getsize(file_path)
 
-            export_size = total_size
+                image_size = total_size
 
-        else:
-            # Export to tar file (default behavior)
-            with open(final_output_path, 'wb') as f:
-                for chunk in image_obj.save():
-                    f.write(chunk)
+            except Exception as e:
+                logger.warning(f"Could not extract image details: {str(e)}")
+                image_id = "unknown"
+                image_size = 0
 
-            logger.info(f"Image successfully exported to tar file: {final_output_path}")
+            logger.info(f"Image downloaded successfully. ID: {image_id}, Size: {image_size} bytes")
 
-            # Get file size of the tar file
-            export_size = os.path.getsize(final_output_path)
+            # Ensure output directory exists
+            if export_format == "folder":
+                output_dir = final_output_path
+            else:
+                output_dir = os.path.dirname(final_output_path)
 
-        return {
-            "export_path": final_output_path,
-            "image_id": image_id,
-            "image_size": export_size,
-            "export_format": export_format
-        }
+            if output_dir:
+                Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-    except docker.errors.DockerException as e:
-        logger.error(f"Docker error occurred: {str(e)}")
-        raise Exception(f"Docker operation failed: {str(e)}")
+            # Export image based on format
+            logger.info(f"Exporting image as {export_format} to: {final_output_path}")
+
+            if export_format == "folder":
+                # Copy the OCI directory structure to output folder
+                logger.info(f"Copying OCI image to folder: {final_output_path}")
+                shutil.copytree(temp_image_path, final_output_path, dirs_exist_ok=True)
+
+                logger.info(f"Image successfully copied to folder: {final_output_path}")
+
+                # Calculate total size of copied folder
+                export_size = 0
+                for dirpath, _, filenames in os.walk(final_output_path):
+                    for filename in filenames:
+                        filepath = os.path.join(dirpath, filename)
+                        if os.path.exists(filepath):
+                            export_size += os.path.getsize(filepath)
+
+            else:
+                # Create tar file from OCI directory
+                logger.info(f"Creating tar file from OCI image: {final_output_path}")
+                with tarfile.open(final_output_path, 'w') as tar:
+                    tar.add(temp_image_path, arcname=os.path.basename(final_output_path).replace('.tar', ''))
+
+                logger.info(f"Image successfully exported to tar file: {final_output_path}")
+
+                # Get file size of the tar file
+                export_size = os.path.getsize(final_output_path)
+
+            return {
+                "export_path": final_output_path,
+                "image_id": image_id,
+                "image_size": export_size,
+                "export_format": export_format
+            }
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Skopeo command failed: {e.stderr}")
+        raise Exception(f"Failed to export Docker image with skopeo: {e.stderr}")
     except Exception as e:
         logger.error(f"Unexpected error occurred: {str(e)}")
         raise Exception(f"Failed to export Docker image: {str(e)}")
-    finally:
-        # Clean up Docker client
-        try:
-            client.close()
-        except:
-            pass
