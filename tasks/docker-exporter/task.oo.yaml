@@ -64,7 +64,7 @@ executor:
 title: "Docker Image Exporter (Skopeo)"
 icon: ":carbon:cloud-download:"
 description: "Download Docker images with specific architecture using skopeo and
-  export them as tar files or extracted folders for offline use. Skopeo is a
-  lightweight alternative to Docker."
+  export them as Docker archive tar files or extracted folders for offline use.
+  Skopeo is a lightweight alternative to Docker that exports in Docker format."
 ui:
   default_width: 550.2010353039436

@@ -15,9 +15,6 @@ import subprocess
 import os
 import logging
 import tarfile
-import tempfile
-import json
-import shutil
 from pathlib import Path
 from oocana import Context
 
@@ -87,131 +84,130 @@ def main(params: Inputs, context: Context) -> Outputs:
         logger.info(f"Final output path: {final_output_path}")
         logger.info(f"Export format: {export_format}")
 
-        # Create temporary directory for skopeo operations
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_image_path = os.path.join(temp_dir, "temp_image")
+        # Ensure output directory exists
+        if export_format == "folder":
+            output_dir = final_output_path
+        else:
+            output_dir = os.path.dirname(final_output_path)
 
-            # Build skopeo command with platform override if specified
-            skopeo_cmd = ["skopeo", "copy"]
+        if output_dir:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
 
-            # Add platform override if specified
+        # Remove existing file if it exists (docker-archive doesn't support overwriting)
+        if export_format == "tar" and os.path.exists(final_output_path):
+            os.remove(final_output_path)
+            logger.info(f"Removed existing tar file: {final_output_path}")
+
+        # Build skopeo command with platform override if specified
+        skopeo_cmd = ["skopeo", "copy"]
+
+        # Add platform override if specified
+        if platform and platform.lower() != "all":
+            skopeo_cmd.extend(["--override-os", platform.split("/")[0]])
+            if "/" in platform:
+                skopeo_cmd.extend(["--override-arch", platform.split("/")[1]])
+
+        # Add source and destination - preserve original repository name and tag for proper naming
+        source_image = f"docker://{image_name}"
+
+        # Parse image name to extract repository and tag
+        if ':' in image_name:
+            # Image name contains a tag (e.g., nginx:1.21 or registry/repo:tag)
+            parts = image_name.split(':')
+            if len(parts) == 2 and '/' not in parts[-1] and '.' not in parts[-1]:
+                # Simple case: nginx:1.21 - last part is tag
+                image_repo = parts[0]
+                image_tag = parts[1]
+            else:
+                # Complex case: registry/namespace/repo:tag or no tag
+                # Check if last part looks like a tag (no / and no .)
+                if '/' not in parts[-1] and '.' not in parts[-1]:
+                    image_repo = ':'.join(parts[:-1])
+                    image_tag = parts[-1]
+                else:
+                    # No tag, just repository name
+                    image_repo = image_name
+                    image_tag = 'latest'
+        else:
+            # No tag specified, use 'latest'
+            image_repo = image_name
+            image_tag = 'latest'
+
+        # Use the original repository name and tag for the archive to preserve naming
+        dest_image = f"docker-archive:{final_output_path}:{image_repo}:{image_tag}"
+
+        skopeo_cmd.extend([source_image, dest_image])
+
+        logger.info(f"Running skopeo command: {' '.join(skopeo_cmd)}")
+
+        # Run skopeo to download the image
+        try:
+            result = subprocess.run(skopeo_cmd, check=True, capture_output=True, text=True)
+            logger.info(f"Skopeo output: {result.stdout}")
+        except subprocess.CalledProcessError as e:
+            # Try without platform specification if specific platform fails
             if platform and platform.lower() != "all":
-                skopeo_cmd.extend(["--override-os", platform.split("/")[0]])
-                if "/" in platform:
-                    skopeo_cmd.extend(["--override-arch", platform.split("/")[1]])
-
-            # Add source and destination
-            source_image = f"docker://{image_name}"
-            dest_image = f"oci:{temp_image_path}"
-
-            skopeo_cmd.extend([source_image, dest_image])
-
-            logger.info(f"Running skopeo command: {' '.join(skopeo_cmd)}")
-
-            # Run skopeo to download the image
-            try:
-                subprocess.run(skopeo_cmd, check=True, capture_output=True, text=True)
-            except subprocess.CalledProcessError as e:
-                # Try without platform specification if specific platform fails
-                if platform and platform.lower() != "all":
-                    logger.warning(f"Platform {platform} not found, trying default platform")
-                    fallback_cmd = ["skopeo", "copy", source_image, dest_image]
-                    subprocess.run(fallback_cmd, check=True, capture_output=True, text=True)
-                else:
-                    raise Exception(f"Failed to download image with skopeo: {e.stderr}")
-
-            # Get image details from the OCI layout
-            try:
-                # Read the manifest to get image details
-                manifest_path = os.path.join(temp_image_path, "blobs", "sha256")
-                index_path = os.path.join(temp_image_path, "index.json")
-
-                if os.path.exists(index_path):
-                    with open(index_path, 'r') as f:
-                        index_data = json.load(f)
-
-                    # Get the first manifest digest
-                    if index_data.get("manifests"):
-                        manifest_digest = index_data["manifests"][0]["digest"]
-                        manifest_file = os.path.join(manifest_path, manifest_digest.split(":")[1])
-
-                        if os.path.exists(manifest_file):
-                            with open(manifest_file, 'r') as f:
-                                manifest_data = json.load(f)
-
-                            # Extract image ID from config digest
-                            if manifest_data.get("config"):
-                                image_id = manifest_data["config"]["digest"]
-                            else:
-                                image_id = manifest_digest
-                        else:
-                            image_id = manifest_digest
-                    else:
-                        image_id = "unknown"
-                else:
-                    image_id = "unknown"
-
-                # Calculate total size of downloaded image
-                total_size = 0
-                for root, dirs, files in os.walk(temp_image_path):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        if os.path.exists(file_path):
-                            total_size += os.path.getsize(file_path)
-
-                image_size = total_size
-
-            except Exception as e:
-                logger.warning(f"Could not extract image details: {str(e)}")
-                image_id = "unknown"
-                image_size = 0
-
-            logger.info(f"Image downloaded successfully. ID: {image_id}, Size: {image_size} bytes")
-
-            # Ensure output directory exists
-            if export_format == "folder":
-                output_dir = final_output_path
+                logger.warning(f"Platform {platform} not found, trying default platform")
+                fallback_cmd = ["skopeo", "copy", source_image, dest_image]
+                result = subprocess.run(fallback_cmd, check=True, capture_output=True, text=True)
+                logger.info(f"Fallback skopeo output: {result.stdout}")
             else:
-                output_dir = os.path.dirname(final_output_path)
+                raise Exception(f"Failed to download image with skopeo: {e.stderr}")
 
-            if output_dir:
-                Path(output_dir).mkdir(parents=True, exist_ok=True)
+        # Get image details from the Docker archive file
+        try:
+            image_id = "unknown"
+            image_size = 0
 
-            # Export image based on format
-            logger.info(f"Exporting image as {export_format} to: {final_output_path}")
+            if os.path.exists(final_output_path):
+                # Get file size
+                image_size = os.path.getsize(final_output_path)
 
-            if export_format == "folder":
-                # Copy the OCI directory structure to output folder
-                logger.info(f"Copying OCI image to folder: {final_output_path}")
-                shutil.copytree(temp_image_path, final_output_path, dirs_exist_ok=True)
+                # Try to extract basic info from filename
+                clean_image_name = image_name.replace(':', '_').replace('/', '_')
+                image_id = f"sha256:{clean_image_name}"
 
-                logger.info(f"Image successfully copied to folder: {final_output_path}")
+        except Exception as e:
+            logger.warning(f"Could not extract image details: {str(e)}")
+            image_id = "unknown"
+            image_size = 0
 
-                # Calculate total size of copied folder
-                export_size = 0
-                for dirpath, _, filenames in os.walk(final_output_path):
-                    for filename in filenames:
-                        filepath = os.path.join(dirpath, filename)
-                        if os.path.exists(filepath):
-                            export_size += os.path.getsize(filepath)
+        logger.info(f"Image downloaded successfully. ID: {image_id}, Size: {image_size} bytes")
 
-            else:
-                # Create tar file from OCI directory
-                logger.info(f"Creating tar file from OCI image: {final_output_path}")
-                with tarfile.open(final_output_path, 'w') as tar:
-                    tar.add(temp_image_path, arcname=os.path.basename(final_output_path).replace('.tar', ''))
+        # Export image based on format
+        logger.info(f"Exporting image as {export_format} to: {final_output_path}")
 
-                logger.info(f"Image successfully exported to tar file: {final_output_path}")
+        if export_format == "folder":
+            # Extract Docker archive to folder using tar
+            logger.info(f"Extracting Docker archive to folder: {final_output_path}")
 
-                # Get file size of the tar file
-                export_size = os.path.getsize(final_output_path)
+            # Create directory for extraction
+            Path(final_output_path).mkdir(parents=True, exist_ok=True)
 
-            return {
-                "export_path": final_output_path,
-                "image_id": image_id,
-                "image_size": export_size,
-                "export_format": export_format
-            }
+            # Extract the tar file
+            with tarfile.open(final_output_path, 'r') as tar:
+                tar.extractall(path=final_output_path)
+
+            logger.info(f"Image successfully extracted to folder: {final_output_path}")
+
+            # Calculate total size of extracted folder
+            export_size = 0
+            for dirpath, _, filenames in os.walk(final_output_path):
+                for filename in filenames:
+                    filepath = os.path.join(dirpath, filename)
+                    if os.path.exists(filepath):
+                        export_size += os.path.getsize(filepath)
+
+        else:
+            logger.info(f"Image successfully exported to tar file: {final_output_path}")
+            export_size = image_size
+
+        return {
+            "export_path": final_output_path,
+            "image_id": image_id,
+            "image_size": export_size,
+            "export_format": export_format
+        }
 
     except subprocess.CalledProcessError as e:
         logger.error(f"Skopeo command failed: {e.stderr}")
